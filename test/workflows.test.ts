@@ -64,6 +64,96 @@ test('dispatch locates the first inventory-bound crossing without corrupting tra
   assert.equal(result.trajectory.at(-1)!.hour, 1);
 });
 
+test('long injection step locates the pressure crossing on the continuous trajectory', () => {
+  const composition = { H2: 1, CH4: 0, N2: 0, CO2: 0 };
+  const limits = { minPressureKpa: 100, maxPressureKpa: 10_000, cavernVolumeM3: 500, thermalRelaxationPerHour: 0 };
+  const steps = [{ startHour: 0, durationHours: 4, flowMolPerSecond: 10, inletTemperatureK: 300 }];
+  const coarse = simulateDispatch({ pressureKpa: 0, temperatureK: 300, totalMoles: 1_900_000, composition }, steps, limits, 4);
+  const fine = simulateDispatch({ pressureKpa: 0, temperatureK: 300, totalMoles: 1_900_000, composition }, steps, limits, 0.001);
+  assert.ok(coarse.firstViolation);
+  assert.deepEqual(coarse.firstViolation.violated, ['maximum-pressure']);
+  assert.ok(Math.abs(coarse.firstViolation.hour - fine.firstViolation!.hour) < 1e-6);
+  assert.ok(Math.abs(coarse.firstViolation.pressureKpa - 10_000) < 1e-6);
+  assert.equal(coarse.completedHour, 4);
+});
+
+test('simultaneous pressure and inventory crossings return the complete trigger set', () => {
+  const composition = { H2: 1, CH4: 0, N2: 0, CO2: 0 };
+  const boundaryMoles = 960_000;
+  const boundaryPressure = solveGasState(boundaryMoles, 500, 300, composition).pressureKpa;
+  const result = simulateDispatch(
+    { pressureKpa: 0, temperatureK: 300, totalMoles: 1_000_000, composition },
+    [{ startHour: 0, durationHours: 4, flowMolPerSecond: -5, inletTemperatureK: 300 }],
+    { minPressureKpa: boundaryPressure, maxPressureKpa: 50_000, minMoles: boundaryMoles, maxMoles: 2_000_000, cavernVolumeM3: 500, thermalRelaxationPerHour: 0 },
+    4,
+  );
+  assert.ok(result.firstViolation);
+  assert.deepEqual(result.firstViolation.violated, ['minimum-pressure', 'minimum-inventory']);
+  assert.ok(Math.abs(result.firstViolation.hour - (40_000 / 5 / 3600)) < 1e-9);
+});
+
+test('idle heat exchange locates the envelope crossing inside the gap', () => {
+  const composition = { H2: 1, CH4: 0, N2: 0, CO2: 0 };
+  const limits = { minPressureKpa: 100, maxPressureKpa: 5_100, cavernVolumeM3: 500, thermalRelaxationPerHour: 0.5 };
+  const result = simulateDispatch(
+    { pressureKpa: 0, temperatureK: 300, totalMoles: 1_000_000, composition },
+    [
+      { startHour: 0, durationHours: 2, flowMolPerSecond: 10, inletTemperatureK: 250 },
+      { startHour: 8, durationHours: 1, flowMolPerSecond: 0, inletTemperatureK: 300 },
+    ],
+    limits,
+    2,
+  );
+  assert.ok(result.firstViolation);
+  assert.deepEqual(result.firstViolation.violated, ['maximum-pressure']);
+  assert.ok(result.firstViolation.hour > 2 && result.firstViolation.hour < 8);
+  let expected = null;
+  const gapMoles = 1_000_000 + 10 * 3600 * 2;
+  const gapStartTemperature = 250 + 50 * Math.exp(-1);
+  for (let hour = 2; hour <= 8; hour += 1e-4) {
+    const temperatureK = 300 + (gapStartTemperature - 300) * Math.exp(-0.5 * (hour - 2));
+    if (solveGasState(gapMoles, 500, temperatureK, composition).pressureKpa > 5_100) { expected = hour; break; }
+  }
+  assert.ok(Math.abs(result.firstViolation.hour - expected!) < 1e-3);
+  assert.equal(result.trajectory[1].hour, 2);
+  assert.equal(result.trajectory[2].hour, 8);
+  assert.equal(result.completedHour, 9);
+});
+
+test('interior pressure excursion is reported even when the step ends safe', () => {
+  const composition = { H2: 1, CH4: 0, N2: 0, CO2: 0 };
+  const result = simulateDispatch(
+    { pressureKpa: 0, temperatureK: 300, totalMoles: 1_000_000, composition },
+    [{ startHour: 0, durationHours: 6, flowMolPerSecond: -5, inletTemperatureK: 360 }],
+    { minPressureKpa: 100, maxPressureKpa: 5_450, cavernVolumeM3: 500, thermalRelaxationPerHour: 2 },
+    6,
+  );
+  assert.ok(result.firstViolation);
+  assert.deepEqual(result.firstViolation.violated, ['maximum-pressure']);
+  assert.ok(result.firstViolation.hour > 0 && result.firstViolation.hour < 6);
+  assert.ok(result.trajectory.at(-1)!.safe);
+  assert.equal(result.completedHour, 6);
+});
+
+test('violation at an interval start is reported at the phase boundary', () => {
+  const composition = { H2: 1, CH4: 0, N2: 0, CO2: 0 };
+  const boundaryPressure = solveGasState(1_000_000, 500, 300, composition).pressureKpa;
+  const result = simulateDispatch(
+    { pressureKpa: 0, temperatureK: 300, totalMoles: 1_000_000, composition },
+    [
+      { startHour: 0, durationHours: 1, flowMolPerSecond: 0, inletTemperatureK: 300 },
+      { startHour: 1, durationHours: 1, flowMolPerSecond: 5, inletTemperatureK: 300 },
+    ],
+    { minPressureKpa: 100, maxPressureKpa: boundaryPressure, cavernVolumeM3: 500, thermalRelaxationPerHour: 0 },
+    1,
+  );
+  assert.ok(result.firstViolation);
+  assert.ok(Math.abs(result.firstViolation.hour - 1) < 1e-9);
+  assert.deepEqual(result.firstViolation.violated, ['maximum-pressure']);
+  assert.equal(result.trajectory.at(-1)!.hour, 2);
+  assert.equal(result.completedHour, 2);
+});
+
 test('facility allocator distributes an infeasible priority minimum within its own tier', () => {
   const result = allocateSharedCapacity([
     { cavernId: 'priority-a', requestedMolPerSecond: 10, minimumMolPerSecond: 6, priority: 2, weight: 1 },

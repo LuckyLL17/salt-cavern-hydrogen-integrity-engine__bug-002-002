@@ -4,14 +4,17 @@ import { simulateDispatch, type DispatchLimits, type DispatchState } from '../do
 import { evaluateWellbore, maximumWellboreStress, type WellSegment } from '../domain/wellbore/evaluator.ts';
 import { correctSample } from '../domain/monitoring/correction.ts';
 import { fuseLeakEvidence } from '../domain/leak/fusion.ts';
-import { withdrawFromLayers, type InventoryLayer, type Withdrawal } from '../domain/purity/withdrawal.ts';
+import { withdrawFromLayers, type Withdrawal } from '../domain/purity/withdrawal.ts';
+import type { InventoryLayer } from '../domain/purity/layers.ts';
 import { blendProducts } from '../domain/purity/blending.ts';
 import { sampleParameters, type UncertaintyInput } from '../domain/uncertainty/sampler.ts';
 import { cavernVolumeM3, cavernVolumeToDepth } from '../domain/geometry/interface-volume.ts';
 import { depthAtCumulativeVolume } from '../domain/geometry/inversion.ts';
-import { advanceGeoHistory, initialGeoState, type GeoInterval, type GeoParameters, type GeoState } from '../domain/geomechanics/history.ts';
+import { advanceGeoHistory } from '../domain/geomechanics/history.ts';
+import { initialGeoState, type GeoInterval, type GeoParameters, type GeoState } from '../domain/geomechanics/damage-state.ts';
 import { safetyPressureEnvelope } from '../domain/geomechanics/pressure-envelope.ts';
-import { allocateSharedCapacity, type FacilityRequest } from '../domain/facility/allocator.ts';
+import { allocateSharedCapacity } from '../domain/facility/allocator.ts';
+import type { FacilityRequest } from '../domain/facility/request.ts';
 import { solveGasState } from '../domain/dispatch/eos.ts';
 import type { Calibration, LeakEvidence, GeometryPoint, Composition } from '../domain/types.ts';
 

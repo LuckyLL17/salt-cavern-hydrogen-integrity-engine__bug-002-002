@@ -2,25 +2,14 @@ import { DomainError } from '../errors.ts';
 import { normalizeComposition } from '../inventory/composition.ts';
 import { normalizeTimeline } from './timeline.ts';
 import { solveGasState } from './eos.ts';
-import { evaluateLimits, firstLimitCrossing, type PressureLimits } from './limits.ts';
-import type { Composition, ScheduleStep } from '../types.ts';
+import { evaluateLimits, firstContinuousCrossing, type PressureLimits } from './limits.ts';
+import { COMPONENTS, type Composition, type ScheduleStep } from '../types.ts';
 export type DispatchState = { pressureKpa: number; temperatureK: number; totalMoles: number; composition?: Composition };
 export type DispatchLimits = PressureLimits & { cavernVolumeM3: number; thermalRelaxationPerHour: number; maxStepHours?: number };
 export type DispatchPoint = { hour: number; pressureKpa: number; temperatureK: number; totalMoles: number; composition: Composition; safe: boolean; violated: string[] };
 export type DispatchResult = { trajectory: DispatchPoint[]; firstViolation: DispatchPoint | null; completedHour: number };
 
-function locateViolation(before: DispatchPoint, after: DispatchPoint, limits: DispatchLimits, compositionAt: (fraction: number) => Composition = () => after.composition): DispatchPoint {
-  const crossing = firstLimitCrossing(before.pressureKpa, after.pressureKpa, before.totalMoles, after.totalMoles, limits);
-  if (!crossing) return after;
-  const fraction = crossing.fraction;
-  return {
-    hour: before.hour + (after.hour - before.hour) * fraction,
-    pressureKpa: before.pressureKpa + (after.pressureKpa - before.pressureKpa) * fraction,
-    temperatureK: before.temperatureK + (after.temperatureK - before.temperatureK) * fraction,
-    totalMoles: before.totalMoles + (after.totalMoles - before.totalMoles) * fraction,
-    composition: compositionAt(fraction), safe: false, violated: crossing.violated,
-  };
-}
+type AdvanceSample = { pressureKpa: number; temperatureK: number; totalMoles: number; composition: Composition };
 
 function mixComposition(base: Composition, baseMoles: number, incoming: Composition, incomingMoles: number): Composition {
   const total = baseMoles + incomingMoles;
@@ -39,38 +28,69 @@ export function simulateDispatch(initial: DispatchState, steps: ScheduleStep[], 
   const initialLimits = evaluateLimits(state.pressureKpa, state.totalMoles, limits);
   const trajectory: DispatchPoint[] = [{ hour, ...state, composition: { ...composition }, safe: initialLimits.safe, violated: initialLimits.violated }];
   let firstViolation = initialLimits.safe ? null : trajectory[0];
+  const relaxation = limits.thermalRelaxationPerHour;
+  const locateCrossing = (sample: (elapsedHours: number) => AdvanceSample, spanHours: number, startHour: number, monotone: boolean, slopeEpsilonHours?: number): void => {
+    const crossing = firstContinuousCrossing((elapsedHours) => {
+      const point = sample(elapsedHours);
+      return { pressureKpa: point.pressureKpa, totalMoles: point.totalMoles };
+    }, spanHours, limits, { monotone, slopeEpsilonHours });
+    if (!crossing) return;
+    const at = sample(crossing.elapsedHours);
+    firstViolation = { hour: startHour + crossing.elapsedHours, pressureKpa: at.pressureKpa, temperatureK: at.temperatureK, totalMoles: at.totalMoles, composition: { ...at.composition }, safe: false, violated: crossing.violated };
+  };
   for (const interval of timeline) {
     if (interval.startHour > hour) {
       const gap = interval.startHour - hour;
-      const beforeGap = trajectory.at(-1)!;
-      const cooling = state.temperatureK + (initial.temperatureK - state.temperatureK) * (1 - Math.exp(-limits.thermalRelaxationPerHour * gap));
-      const gapGas = solveGasState(state.totalMoles, limits.cavernVolumeM3, cooling, composition);
-      const gapStatus = evaluateLimits(gapGas.pressureKpa, state.totalMoles, limits);
-      const gapPoint: DispatchPoint = { hour: interval.startHour, pressureKpa: gapGas.pressureKpa, temperatureK: cooling, totalMoles: state.totalMoles, composition: { ...composition }, safe: gapStatus.safe, violated: gapStatus.violated };
-      state = { pressureKpa: gapGas.pressureKpa, temperatureK: cooling, totalMoles: state.totalMoles };
+      const gapMoles = state.totalMoles;
+      const gapStartTemperature = state.temperatureK;
+      const gapComposition = composition;
+      const gapSample = (elapsedHours: number): AdvanceSample => {
+        const temperatureK = initial.temperatureK + (gapStartTemperature - initial.temperatureK) * Math.exp(-relaxation * elapsedHours);
+        return { pressureKpa: solveGasState(gapMoles, limits.cavernVolumeM3, temperatureK, gapComposition).pressureKpa, temperatureK, totalMoles: gapMoles, composition: gapComposition };
+      };
+      const gapEnd = gapSample(gap);
+      const gapStatus = evaluateLimits(gapEnd.pressureKpa, gapMoles, limits);
+      if (!gapStatus.safe && !firstViolation) locateCrossing(gapSample, gap, hour, true);
+      state = { pressureKpa: gapEnd.pressureKpa, temperatureK: gapEnd.temperatureK, totalMoles: gapMoles };
       hour = interval.startHour;
-      trajectory.push(gapPoint);
-      if (!gapStatus.safe && !firstViolation) firstViolation = locateViolation(beforeGap, gapPoint, limits);
+      trajectory.push({ hour, ...state, composition: { ...composition }, safe: gapStatus.safe, violated: gapStatus.violated });
     }
     const inlet = normalizeComposition(interval.inletComposition ?? composition);
     const count = Math.max(1, Math.ceil(interval.durationHours / maxStepHours));
     const dt = interval.durationHours / count;
+    const moleRatePerHour = interval.flowMolPerSecond * 3600;
     for (let index = 0; index < count; index += 1) {
-      const before: DispatchPoint = { ...state, composition: { ...composition }, hour, safe: true, violated: [] };
-      const deltaMoles = interval.flowMolPerSecond * dt * 3600;
-      const nextMoles = state.totalMoles + deltaMoles;
+      const startHour = hour;
+      const startMoles = state.totalMoles;
+      const startTemperature = state.temperatureK;
+      const startComposition = composition;
+      const deltaMoles = moleRatePerHour * dt;
+      const nextMoles = startMoles + deltaMoles;
       if (nextMoles < -1e-8) throw new DomainError('WITHDRAWAL_EXCEEDS_INVENTORY', 'Scheduled withdrawal exceeds available gas', 409, { hour, availableMol: state.totalMoles, requestedMol: -deltaMoles });
       const added = Math.max(0, deltaMoles);
-      const mixed = interval.flowMolPerSecond >= 0 ? mixComposition(composition, state.totalMoles, inlet, added) : composition;
-      const nextTemperature = state.temperatureK + (interval.inletTemperatureK - state.temperatureK) * (1 - Math.exp(-limits.thermalRelaxationPerHour * dt));
+      const mixed = interval.flowMolPerSecond >= 0 ? mixComposition(startComposition, startMoles, inlet, added) : startComposition;
+      const nextTemperature = startTemperature + (interval.inletTemperatureK - startTemperature) * (1 - Math.exp(-relaxation * dt));
       const gas = solveGasState(Math.max(0, nextMoles), limits.cavernVolumeM3, nextTemperature, mixed);
-      const nextHour = interval.startHour + (index + 1) * dt;
+      const nextHour = index + 1 === count ? interval.endHour : startHour + dt;
       const status = evaluateLimits(gas.pressureKpa, Math.max(0, nextMoles), limits);
-      let point: DispatchPoint = { hour: nextHour, pressureKpa: gas.pressureKpa, temperatureK: nextTemperature, totalMoles: Math.max(0, nextMoles), composition: mixed, safe: status.safe, violated: status.violated };
-      if (!status.safe && !firstViolation) {
-        firstViolation = locateViolation(before, point, limits, (fraction) => interval.flowMolPerSecond >= 0
-          ? mixComposition(composition, before.totalMoles, inlet, Math.max(0, deltaMoles * fraction))
-          : composition);
+      const point: DispatchPoint = { hour: nextHour, pressureKpa: gas.pressureKpa, temperatureK: nextTemperature, totalMoles: Math.max(0, nextMoles), composition: mixed, safe: status.safe, violated: status.violated };
+      if (!firstViolation) {
+        const temperatureActive = relaxation > 0 && interval.inletTemperatureK !== startTemperature;
+        const compositionActive = interval.flowMolPerSecond > 0 && COMPONENTS.some((key) => Math.abs(inlet[key] - startComposition[key]) > 1e-12);
+        const monotone = !(temperatureActive && interval.flowMolPerSecond !== 0) && !compositionActive;
+        if (!status.safe || !monotone) {
+          const dynamicScales = [dt];
+          if (relaxation > 0) dynamicScales.push(1 / relaxation);
+          if (interval.flowMolPerSecond !== 0 && startMoles > 0) dynamicScales.push(startMoles / Math.abs(moleRatePerHour));
+          const slopeEpsilonHours = Math.min(...dynamicScales) * 1e-6;
+          const stepSample = (elapsedHours: number): AdvanceSample => {
+            const moles = Math.max(0, startMoles + moleRatePerHour * elapsedHours);
+            const temperatureK = interval.inletTemperatureK + (startTemperature - interval.inletTemperatureK) * Math.exp(-relaxation * elapsedHours);
+            const stepComposition = interval.flowMolPerSecond > 0 ? mixComposition(startComposition, startMoles, inlet, moleRatePerHour * elapsedHours) : startComposition;
+            return { pressureKpa: solveGasState(moles, limits.cavernVolumeM3, temperatureK, stepComposition).pressureKpa, temperatureK, totalMoles: moles, composition: stepComposition };
+          };
+          locateCrossing(stepSample, dt, startHour, monotone, slopeEpsilonHours);
+        }
       }
       state = { pressureKpa: gas.pressureKpa, temperatureK: nextTemperature, totalMoles: Math.max(0, nextMoles) };
       composition = mixed;
